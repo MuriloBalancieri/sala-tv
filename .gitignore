@@ -1,0 +1,16 @@
+.venv/
+dados/
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.log
+.env
+.env.*
+!*.example
+config.local.json
+*.mp4
+*.mkv
+*.avi
+*.srt
+*.zip
+work/

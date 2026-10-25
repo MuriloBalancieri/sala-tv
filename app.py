@@ -64,7 +64,7 @@ def initialize():
         db.execute("INSERT OR IGNORE INTO settings VALUES ('control_path','/upnp/control/AVTransport1')")
         db.execute("INSERT OR IGNORE INTO settings VALUES ('control_port','9197')")
         columns={row['name'] for row in db.execute('PRAGMA table_info(media)')}
-        for name,definition in (('series_name',"TEXT NOT NULL DEFAULT ''"),('season','INTEGER NOT NULL DEFAULT 1'),('episode','INTEGER NOT NULL DEFAULT 0'),('tmdb_id','INTEGER'),('tmdb_type',"TEXT NOT NULL DEFAULT ''"),('poster_revision','INTEGER NOT NULL DEFAULT 0')):
+        for name,definition in (('watched','INTEGER NOT NULL DEFAULT 0'),('continue_hidden','INTEGER NOT NULL DEFAULT 0'),('series_name',"TEXT NOT NULL DEFAULT ''"),('season','INTEGER NOT NULL DEFAULT 1'),('episode','INTEGER NOT NULL DEFAULT 0'),('tmdb_id','INTEGER'),('tmdb_type',"TEXT NOT NULL DEFAULT ''"),('poster_revision','INTEGER NOT NULL DEFAULT 0')):
             if name not in columns:
                 db.execute(f'ALTER TABLE media ADD COLUMN {name} {definition}')
         for row in db.execute("SELECT id,path,title FROM media WHERE kind='serie' AND series_name='' ").fetchall():
@@ -221,6 +221,19 @@ def media_url(ident):
 
 def media_mime(path):
     return {'.mkv':'video/x-mkv','.avi':'video/x-msvideo','.ts':'video/mpeg'}.get(Path(path).suffix.lower(),mimetypes.guess_type(str(path))[0] or 'video/mp4')
+
+
+def set_watch_status(ident, action):
+    if action not in ('hide', 'watched', 'unwatched'):
+        raise ValueError('Opção de acompanhamento inválida.')
+    get_media(ident)
+    with connect() as db:
+        if action == 'hide':
+            db.execute('UPDATE media SET continue_hidden=1 WHERE id=?', (ident,))
+        else:
+            db.execute('UPDATE media SET watched=?,continue_hidden=? WHERE id=?',
+                       (int(action == 'watched'), int(action == 'watched'), ident))
+
 
 def save_position(ident, pos, duration=0):
     # Um STOP pode devolver zero; ele nao deve apagar o ultimo ponto valido.
@@ -437,6 +450,7 @@ def play(ident, resume=True):
         item = get_media(ident)
         if not Path(item['path']).is_file():
             raise ValueError('O arquivo foi movido ou não está disponível.')
+        resume = resume and not item['watched']
         target = max(0,item['position']-3) if resume else 0
         url = media_url(ident)
         caption = f'http://{pc_ip()}:{PORT}/media/{ident}/movie.srt'
@@ -456,6 +470,8 @@ def play(ident, resume=True):
                 soap('Play',{'InstanceID':0,'Speed':1})
             except RuntimeError:
                 pass  # O firmware pode iniciar sozinho ao receber a URI.
+            with connect() as db:
+                db.execute('UPDATE media SET watched=0,continue_hidden=0 WHERE id=?', (ident,))
             with LOCK:
                 STATE['active'] = ident
             if target >= 5:
@@ -724,6 +740,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise ValueError('Informe uma temporada e um episódio válidos.')
                 with connect() as db: db.execute('UPDATE media SET title=?,kind=?,series_name=?,season=?,episode=? WHERE id=?',
                     (title,data['kind'],series_name,season,episode,data['id']))
+            elif self.path=='/api/watch-status':
+                set_watch_status(data['id'],data.get('action'))
             elif self.path=='/api/remove':
                 remove_media(data['id'])
             elif self.path=='/api/shutdown':

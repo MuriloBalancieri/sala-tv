@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import app
 import tmdb_covers
@@ -34,6 +35,39 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(app.get_media('a'*20)['position'],60)
         app.save_position('a'*20,100,1000)
         self.assertEqual(app.get_media('a'*20)['position'],100)
+    def test_hide_keeps_library_file_and_bookmark_after_poll(self):
+        video=app.DATA/'test.mp4'
+        video.write_bytes(b'test')
+        self.media('a'*20,video)
+        app.set_watch_status('a'*20,'hide')
+        app.save_position('a'*20,80,1000)
+        item=app.get_media('a'*20)
+        self.assertEqual((item['continue_hidden'],item['position'],item['watched']),(1,80,0))
+        self.assertTrue(video.exists())
+        app.initialize()
+        self.assertEqual(app.get_media('a'*20)['continue_hidden'],1)
+    def test_watched_survives_poll_and_can_be_undone(self):
+        self.media('a'*20,app.DATA/'test.mp4')
+        app.set_watch_status('a'*20,'watched')
+        app.save_position('a'*20,80,1000)
+        self.assertEqual(app.get_media('a'*20)['watched'],1)
+        app.set_watch_status('a'*20,'unwatched')
+        item=app.get_media('a'*20)
+        self.assertEqual((item['watched'],item['continue_hidden'],item['position']),(0,0,80))
+    def test_invalid_watch_action_does_not_change_item(self):
+        self.media('a'*20,app.DATA/'test.mp4')
+        with self.assertRaises(ValueError): app.set_watch_status('a'*20,'delete')
+        self.assertEqual(app.get_media('a'*20)['position'],60)
+    def test_replay_watched_starts_over_and_restores_tracking(self):
+        video=app.DATA/'test.mp4'
+        video.write_bytes(b'test')
+        self.media('a'*20,video)
+        app.set_watch_status('a'*20,'watched')
+        with patch.object(app,'observe'), patch.object(app,'soap',return_value={}) as soap, patch.object(app,'pc_ip',return_value='127.0.0.1'):
+            app.play('a'*20,True)
+        item=app.get_media('a'*20)
+        self.assertEqual((item['watched'],item['continue_hidden'],item['position']),(0,0,0))
+        self.assertNotIn('Seek',[call.args[0] for call in soap.call_args_list])
     def test_remove_preserves_video_and_deletes_cover(self):
         video=app.DATA/'test.mp4'
         video.write_bytes(b'test')

@@ -22,6 +22,8 @@ class CoreTests(unittest.TestCase):
         app.DB=app.DATA/'test.sqlite'
         app.initialize()
         app.STATE['active']=None
+        app.STATE['pending']=False
+        app.STATE.pop('preserve_bookmark',None)
         app.MISSING_FILES.clear()
     def tearDown(self):
         app.DATA,app.DB=self.original
@@ -95,6 +97,54 @@ class CoreTests(unittest.TestCase):
     def test_episode_grouping(self):
         self.assertEqual(app.episode_info(Path('My.Show.S02E10.mkv')),('My Show',2,10))
         self.assertEqual(app.episode_info(Path('My.Show.1x02.mp4')),('My Show',1,2))
+    def test_seek_time_formats_and_invalid_input(self):
+        for value,expected in [('12:30',750),('01:12:30',4350),('0',0),('90:00',5400)]:
+            self.assertEqual(app.parse_seek_time(value),expected)
+        for value in ('-1','NaN','1:99','01:70:00','12.5',True,None):
+            with self.assertRaises(ValueError): app.parse_seek_time(value)
+    def seek_fixture(self):
+        ident='a'*20
+        self.media(ident,app.DATA/'test.mp4')
+        app.STATE['active']=ident
+        return ident,{'TrackURI':f'http://127.0.0.1:8768/media/{ident}/movie.mp4','RelTime':'00:01:00','TrackDuration':'00:16:40'}
+    def test_seek_paused_to_zero_keeps_flags_and_saves_zero(self):
+        ident,info=self.seek_fixture()
+        app.set_watch_status(ident,'hide')
+        with patch.object(app,'soap',side_effect=[info,{'CurrentTransportState':'PAUSED_PLAYBACK'},{},dict(info,RelTime='00:00:00')]) as soap, patch.object(app.time,'sleep'):
+            self.assertEqual(app.seek_video(ident,position='00:00'),0)
+        self.assertEqual(app.get_media(ident)['position'],0)
+        self.assertEqual(app.get_media(ident)['continue_hidden'],1)
+        self.assertEqual([call.args[0] for call in soap.call_args_list],['GetPositionInfo','GetTransportInfo','Seek','GetPositionInfo'])
+        self.assertEqual(soap.call_args_list[2].args[1]['Target'],'00:00:00')
+    def test_seek_relative_uses_live_time_and_clamps_end(self):
+        ident,info=self.seek_fixture()
+        info['RelTime']='00:16:35'
+        with patch.object(app,'soap',side_effect=[info,{'CurrentTransportState':'PLAYING'},{},dict(info,RelTime='00:16:39')]) as soap, patch.object(app.time,'sleep'):
+            self.assertEqual(app.seek_video(ident,offset=10),999)
+        self.assertEqual(soap.call_args_list[2].args[1]['Target'],'00:16:39')
+    def test_seek_relative_clamps_start(self):
+        ident,info=self.seek_fixture()
+        info['RelTime']='00:00:05'
+        with patch.object(app,'soap',side_effect=[info,{'CurrentTransportState':'PLAYING'},{},dict(info,RelTime='00:00:00')]), patch.object(app.time,'sleep'):
+            self.assertEqual(app.seek_video(ident,offset=-10),0)
+    def test_seek_other_video_is_not_controlled(self):
+        ident,info=self.seek_fixture()
+        info['TrackURI']='http://elsewhere/movie.mp4'
+        with patch.object(app,'soap',return_value=info) as soap:
+            with self.assertRaises(ValueError): app.seek_video(ident,position='02:00')
+        self.assertEqual(soap.call_count,1)
+        self.assertEqual(app.get_media(ident)['position'],60)
+    def test_seek_unconfirmed_preserves_bookmark(self):
+        ident,info=self.seek_fixture()
+        with patch.object(app,'soap',side_effect=[info,{'CurrentTransportState':'PLAYING'},{}]+[info]*6), patch.object(app.time,'sleep'):
+            with self.assertRaises(RuntimeError): app.seek_video(ident,position='05:00')
+        self.assertEqual(app.get_media(ident)['position'],60)
+        self.assertEqual(app.STATE['preserve_bookmark'],ident)
+    def test_seek_rejected_by_tv_preserves_bookmark(self):
+        ident,info=self.seek_fixture()
+        with patch.object(app,'soap',side_effect=[info,{'CurrentTransportState':'PLAYING'},RuntimeError('Unsupported')]):
+            with self.assertRaises(RuntimeError): app.seek_video(ident,position='05:00')
+        self.assertEqual(app.get_media(ident)['position'],60)
     def test_ambiguous_cover_not_automatically_selected(self):
         self.assertIsNone(tmdb_covers.automatic_choice([{'score':1},{'score':.99}]))
     def test_description_control_url(self):

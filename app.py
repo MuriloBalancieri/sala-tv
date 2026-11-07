@@ -250,6 +250,65 @@ def save_position(ident, pos, duration=0):
         db.execute('UPDATE media SET position=?,duration=CASE WHEN ?>0 THEN ? ELSE duration END,last_watched=? WHERE id=?',
             (pos,duration,duration,time.time(),ident))
 
+
+def parse_seek_time(value):
+    text = str(value).strip()
+    if re.fullmatch(r'\d{1,7}', text):
+        return int(text)
+    if re.fullmatch(r'\d{1,4}:[0-5]\d(?::[0-5]\d)?', text):
+        parts = [int(part) for part in text.split(':')]
+        return parts[0]*60+parts[1] if len(parts)==2 else parts[0]*3600+parts[1]*60+parts[2]
+    raise ValueError('Informe o tempo em mm:ss ou hh:mm:ss, por exemplo 12:30 ou 01:12:30.')
+
+
+def seek_video(ident, position=None, offset=None):
+    if (position is None) == (offset is None):
+        raise ValueError('Informe um tempo ou um avanço/retorno.')
+    target = parse_seek_time(position) if position is not None else None
+    if offset is not None and (type(offset) is not int or not -3600 <= offset <= 3600):
+        raise ValueError('O avanço/retorno deve ser de até 3600 segundos.')
+    with CONTROL:
+        with LOCK:
+            if STATE['active'] != ident:
+                raise ValueError('Este título não está mais ativo na TV.')
+        item = get_media(ident)
+        info = soap('GetPositionInfo', {'InstanceID':0})
+        uri = info.get('TrackURI') or ''
+        if not re.search(r'/media/'+re.escape(ident)+r'/movie\.', uri):
+            raise ValueError('A TV está reproduzindo outro vídeo. Envie um título da biblioteca primeiro.')
+        transport = soap('GetTransportInfo', {'InstanceID':0})
+        if transport.get('CurrentTransportState') not in ('PLAYING', 'PAUSED_PLAYBACK'):
+            raise ValueError('Inicie ou pause o vídeo antes de ajustar o tempo.')
+        if offset is not None:
+            current = seconds(info.get('RelTime'))
+            if current is None:
+                raise ValueError('A TV não informou o tempo atual. Use um tempo específico.')
+            target = current + offset
+        duration = seconds(info.get('TrackDuration')) or item['duration']
+        target = int(max(0, min(target, max(0, duration-1)) if duration else target))
+        try:
+            soap('Seek', {'InstanceID':0, 'Unit':'REL_TIME', 'Target':clock(target)})
+            for _ in range(6):
+                time.sleep(.5)
+                confirmed = soap('GetPositionInfo', {'InstanceID':0})
+                if confirmed.get('TrackURI') != uri:
+                    raise RuntimeError('O vídeo na TV mudou durante o ajuste.')
+                actual = seconds(confirmed.get('RelTime'))
+                if actual is not None and abs(actual-target) <= 4:
+                    with connect() as db:
+                        db.execute('UPDATE media SET position=?,last_watched=? WHERE id=?',
+                                   (actual,time.time(),ident))
+                    with LOCK:
+                        STATE.pop('preserve_bookmark',None)
+                        STATE['message'] = 'Tempo ajustado para '+clock(actual)+'.'
+                    return actual
+            raise RuntimeError('A TV não confirmou o novo tempo. Seu ponto salvo foi preservado.')
+        except Exception:
+            with LOCK:
+                STATE['preserve_bookmark'] = ident
+            raise
+
+
 def observe():
     with LOCK:
         active, pending = STATE['active'], STATE['pending']
@@ -707,6 +766,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if path and (not Path(path).is_file() or Path(path).suffix.lower()!='.srt'):
                     raise ValueError('Escolha uma legenda SRT existente.')
                 with connect() as db: db.execute('UPDATE media SET subtitle=? WHERE id=?',(path,data['id']))
+            elif self.path=='/api/seek':
+                ident=data.get('id')
+                get_media(ident)
+                with LOCK:
+                    if STATE['pending']: raise ValueError('Aguarde o envio atual.')
+                    if STATE['active']!=ident: raise ValueError('Nenhum título selecionado está ativo na TV.')
+                    STATE.update(pending=True,message='Ajustando o tempo na TV…')
+                def seek_task():
+                    try: seek_video(ident,data.get('position'),data.get('offset'))
+                    except Exception as exc:
+                        with LOCK: STATE['message']=str(exc)
+                    finally:
+                        with LOCK: STATE['pending']=False
+                threading.Thread(target=seek_task,daemon=True).start()
+                return self.send({'ok':True})
             elif self.path=='/api/control':
                 action=data['action']
                 if action not in ('Pause','Play','Stop'): raise ValueError('Comando inválido.')

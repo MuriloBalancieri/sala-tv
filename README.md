@@ -20,6 +20,7 @@ O computador precisa permanecer ligado. Fechar a aba mantém o servidor ativo; *
 - Filmes e episódios importados sem mover ou alterar os arquivos originais.
 - Séries agrupadas em temporadas; nomes `S01E02` e `1x02` reconhecidos automaticamente.
 - Controle remoto da TV para pausar e continuar, além dos controles da interface.
+- Com um vídeo ativo na TV, use **Ir para o tempo** (`12:30` ou `01:12:30`) ou os botões de voltar/avançar 10 segundos. O programa confirma o tempo com a TV antes de salvar o novo ponto; o ajuste também funciona com o vídeo pausado, se o reprodutor aceitar DLNA Seek.
 - Progresso consultado a cada 2 segundos; retomada cerca de 3 segundos antes do ponto salvo.
 - Associação automática de SRT quando o nome corresponde ou há uma única legenda na pasta; seleção manual em **Detalhes**.
 - Capas do TMDB com busca por título/ano e escolha manual para ambiguidades.

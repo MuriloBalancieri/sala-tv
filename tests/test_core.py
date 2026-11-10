@@ -25,6 +25,7 @@ class CoreTests(unittest.TestCase):
         app.STATE['pending']=False
         app.STATE.pop('preserve_bookmark',None)
         app.MISSING_FILES.clear()
+        app.AUDIO_CLEANUP.clear()
     def tearDown(self):
         app.DATA,app.DB=self.original
         self.temp.cleanup()
@@ -56,6 +57,46 @@ class CoreTests(unittest.TestCase):
         app.set_watch_status('a'*20,'unwatched')
         item=app.get_media('a'*20)
         self.assertEqual((item['watched'],item['continue_hidden'],item['position']),(0,0,80))
+    def converted(self, ident):
+        cache=app.DATA/'audio-cache'
+        cache.mkdir(exist_ok=True)
+        path=cache/f'{ident}-{"e"*24}.mp4'
+        path.write_bytes(b'test')
+        return path
+    def test_marking_watched_discards_converted_audio(self):
+        self.media('a'*20,app.DATA/'test.mp4')
+        converted=self.converted('a'*20)
+        app.set_watch_status('a'*20,'watched')
+        self.assertFalse(converted.exists())
+        self.assertNotIn('a'*20,app.AUDIO_CLEANUP)
+    def test_unwatched_and_hide_keep_converted_audio(self):
+        self.media('a'*20,app.DATA/'test.mp4')
+        converted=self.converted('a'*20)
+        app.set_watch_status('a'*20,'hide')
+        app.set_watch_status('a'*20,'unwatched')
+        self.assertTrue(converted.exists())
+    def test_watched_while_playing_defers_cleanup_until_the_copy_is_free(self):
+        self.media('a'*20,app.DATA/'test.mp4')
+        converted=self.converted('a'*20)
+        app.STATE['active']='a'*20
+        app.set_watch_status('a'*20,'watched')
+        self.assertTrue(converted.exists())
+        self.assertIn('a'*20,app.AUDIO_CLEANUP)
+        app.STATE['active']=None
+        app.cleanup_converted()
+        self.assertFalse(converted.exists())
+        self.assertNotIn('a'*20,app.AUDIO_CLEANUP)
+    def test_playing_a_watched_title_cancels_pending_cleanup(self):
+        video=app.DATA/'test.mp4'
+        video.write_bytes(b'test')
+        self.media('a'*20,video)
+        converted=self.converted('a'*20)
+        app.STATE['active']='a'*20
+        app.set_watch_status('a'*20,'watched')
+        with patch.object(app,'observe'), patch.object(app,'soap',return_value={}), patch.object(app,'pc_ip',return_value='127.0.0.1'), patch.object(app,'prepare_tv_media',return_value=(converted,'movie.mp4')):
+            app.play('a'*20,False)
+        self.assertTrue(converted.exists())
+        self.assertNotIn('a'*20,app.AUDIO_CLEANUP)
     def test_invalid_watch_action_does_not_change_item(self):
         self.media('a'*20,app.DATA/'test.mp4')
         with self.assertRaises(ValueError): app.set_watch_status('a'*20,'delete')
@@ -65,7 +106,7 @@ class CoreTests(unittest.TestCase):
         video.write_bytes(b'test')
         self.media('a'*20,video)
         app.set_watch_status('a'*20,'watched')
-        with patch.object(app,'observe'), patch.object(app,'soap',return_value={}) as soap, patch.object(app,'pc_ip',return_value='127.0.0.1'):
+        with patch.object(app,'observe'), patch.object(app,'soap',return_value={}) as soap, patch.object(app,'pc_ip',return_value='127.0.0.1'), patch.object(app,'prepare_tv_media',return_value=(video,'movie.mp4')):
             app.play('a'*20,True)
         item=app.get_media('a'*20)
         self.assertEqual((item['watched'],item['continue_hidden'],item['position']),(0,0,0))

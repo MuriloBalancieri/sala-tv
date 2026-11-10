@@ -23,6 +23,7 @@ import urllib.request
 import webbrowser
 import xml.etree.ElementTree as ET
 import tmdb_covers
+import audio_compat
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('SALA_TV_DATA_DIR', str(ROOT / 'dados'))).expanduser().resolve()
@@ -40,6 +41,7 @@ STATE = {'active': None, 'pending': False, 'state': 'IDLE', 'message': 'Escolha 
 COVER_JOB={'running':False,'done':0,'total':0,'message':''}
 ASSET_LOCK=threading.RLock()
 MISSING_FILES={}
+AUDIO_CLEANUP=set()
 
 @contextmanager
 def connect():
@@ -215,9 +217,14 @@ def pc_ip():
         route.connect((setting('tv_ip'),9197))
         return route.getsockname()[0]
 
-def media_url(ident):
-    suffix = Path(get_media(ident)['path']).suffix.lower()
-    return f'http://{pc_ip()}:{PORT}/media/{ident}/movie{suffix}'
+def prepare_tv_media(item):
+    def adapting():
+        with LOCK:
+            STATE['message'] = 'Adaptando o áudio para AAC estéreo a 48 kHz. Aguarde o preparo antes da reprodução…'
+    with LOCK:
+        active = STATE['active']
+    return audio_compat.prepare(ffmpeg(), DATA/'audio-cache', item['id'], item['path'], adapting, active)
+
 
 def media_mime(path):
     return {'.mkv':'video/x-mkv','.avi':'video/x-msvideo','.ts':'video/mpeg'}.get(Path(path).suffix.lower(),mimetypes.guess_type(str(path))[0] or 'video/mp4')
@@ -233,6 +240,31 @@ def set_watch_status(ident, action):
         else:
             db.execute('UPDATE media SET watched=?,continue_hidden=? WHERE id=?',
                        (int(action == 'watched'), int(action == 'watched'), ident))
+    if action == 'watched':
+        discard_converted(ident)
+
+
+def discard_converted(ident):
+    """Apaga as copias convertidas de um titulo assistido quando elas nao estao em uso."""
+    with LOCK:
+        if STATE['active'] == ident or STATE['pending']:
+            AUDIO_CLEANUP.add(ident)
+            return False
+    remaining = audio_compat.discard(DATA/'audio-cache', ident)
+    with LOCK:
+        if remaining:
+            AUDIO_CLEANUP.add(ident)
+        else:
+            AUDIO_CLEANUP.discard(ident)
+    return not remaining
+
+
+def cleanup_converted():
+    """Repete a limpeza adiada de copias que estavam em uso."""
+    with LOCK:
+        pending = list(AUDIO_CLEANUP)
+    for ident in pending:
+        discard_converted(ident)
 
 
 def save_position(ident, pos, duration=0):
@@ -309,10 +341,10 @@ def seek_video(ident, position=None, offset=None):
             raise
 
 
-def observe():
+def observe(force=False):
     with LOCK:
         active, pending = STATE['active'], STATE['pending']
-    if pending:
+    if pending and not force:
         return
     try:
         position = soap('GetPositionInfo',{'InstanceID':0})
@@ -438,6 +470,8 @@ def maintenance():
     while not ENDING.is_set():
         try: sync_library()
         except Exception as exc: print('Sincronizacao da biblioteca:',exc,flush=True)
+        try: cleanup_converted()
+        except Exception as exc: print('Limpeza de audios convertidos:',exc,flush=True)
         if ENDING.wait(10):
             break
 
@@ -505,25 +539,31 @@ def add_file(path):
 
 def play(ident, resume=True):
     with CONTROL:
-        observe()
-        item = get_media(ident)
-        if not Path(item['path']).is_file():
-            raise ValueError('O arquivo foi movido ou não está disponível.')
-        resume = resume and not item['watched']
-        target = max(0,item['position']-3) if resume else 0
-        url = media_url(ident)
-        caption = f'http://{pc_ip()}:{PORT}/media/{ident}/movie.srt'
-        subtitle = item['subtitle'] and Path(item['subtitle']).is_file()
-        metadata = ('<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
-            'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
-            'xmlns:sec="http://www.sec.co.kr/"><item id="'+ident+'" parentID="0" restricted="1">'
-            '<dc:title>'+html.escape(item['title'])+'</dc:title><upnp:class>object.item.videoItem</upnp:class>'
-            f'<res size="{Path(item["path"]).stat().st_size}" duration="{clock(item["duration"])}" '
-            f'protocolInfo="http-get:*:{media_mime(item["path"])}:DLNA.ORG_OP=01;DLNA.ORG_CI=0">{url}</res>'
-            +(f'<sec:CaptionInfoEx sec:type="srt">{caption}</sec:CaptionInfoEx>' if subtitle else '')+'</item></DIDL-Lite>')
         with LOCK:
-            STATE.update(pending=True,message='Enviando à TV…')
+            STATE.update(pending=True,message='Verificando o áudio do vídeo…')
         try:
+            observe(force=True)
+            item = get_media(ident)
+            if not Path(item['path']).is_file():
+                raise ValueError('O arquivo foi movido ou não está disponível.')
+            resume = resume and not item['watched']
+            target = max(0,item['position']-3) if resume else 0
+            with LOCK:
+                AUDIO_CLEANUP.discard(ident)
+            media_path, filename = prepare_tv_media(item)
+            host = pc_ip()
+            url = f'http://{host}:{PORT}/media/{ident}/{filename}'
+            with LOCK:
+                STATE['message'] = 'Enviando à TV…'
+            caption = f'http://{host}:{PORT}/media/{ident}/movie.srt'
+            subtitle = item['subtitle'] and Path(item['subtitle']).is_file()
+            metadata = ('<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+                'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+                'xmlns:sec="http://www.sec.co.kr/"><item id="'+ident+'" parentID="0" restricted="1">'
+                '<dc:title>'+html.escape(item['title'])+'</dc:title><upnp:class>object.item.videoItem</upnp:class>'
+                f'<res size="{media_path.stat().st_size}" duration="{clock(item["duration"])}" '
+                f'protocolInfo="http-get:*:{media_mime(media_path)}:DLNA.ORG_OP=01;DLNA.ORG_CI=0">{url}</res>'
+                +(f'<sec:CaptionInfoEx sec:type="srt">{caption}</sec:CaptionInfoEx>' if subtitle else '')+'</item></DIDL-Lite>')
             soap('SetAVTransportURI',{'InstanceID':0,'CurrentURI':url,'CurrentURIMetaData':metadata})
             try:
                 soap('Play',{'InstanceID':0,'Speed':1})
@@ -634,7 +674,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def deliver_media(self):
         if self.client_address[0] not in (setting('tv_ip'),'127.0.0.1',pc_ip()):
             return self.send({},403)
-        match=re.fullmatch(r'/media/([a-f0-9]{20})/(movie\.[a-z0-9]+)',self.path)
+        match=re.fullmatch(r'/media/([a-f0-9]{20})/(movie\.(?:[a-f0-9]{24}\.)?[a-z0-9]+)',self.path)
         if not match:
             return self.send({},404)
         try:
@@ -642,10 +682,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             is_sub=match[2]=='movie.srt'
             path=Path(item['subtitle'] or '') if is_sub else Path(item['path'])
             if not is_sub and match[2]!='movie'+path.suffix.lower():
-                raise ValueError()
+                cached, name = audio_compat.cache_entry(DATA/'audio-cache', item['id'], path)
+                if match[2] != name:
+                    raise ValueError()
+                path = cached
             if not path.is_file():
                 raise ValueError()
-        except ValueError:
+        except (ValueError, OSError):
             return self.send({},404)
         content=None
         if is_sub:
@@ -747,6 +790,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 get_media(ident)
                 with LOCK:
                     if STATE['pending']: raise ValueError('Aguarde o envio atual.')
+                    STATE.update(pending=True,message='Verificando o áudio do vídeo…')
                     STATE.pop('preserve_bookmark',None)
                 def task():
                     try: play(ident,data.get('resume',True))

@@ -2,7 +2,7 @@
 
 Biblioteca local de filmes e séries para enviar arquivos do computador ao reprodutor de uma TV Samsung pela rede. Interface em português, carrossel, temporadas e episódios, legendas SRT, capas do TMDB e retomada de reprodução.
 
-**Validado em Windows 11 com Samsung UN55KU6000. Não é compatibilidade universal com Smart TVs.** O programa envia o vídeo original por HTTP/DLNA; não transmite a tela e não converte codecs automaticamente.
+**Validado em Windows 11 com Samsung UN55KU6000. Não é compatibilidade universal com Smart TVs.** O programa envia o vídeo por HTTP/DLNA; não transmite a tela. A imagem não é recodificada, mas o áudio fora do perfil compatível é convertido automaticamente para AAC LC estéreo a 48 kHz.
 
 ## Instalar e abrir
 
@@ -21,6 +21,8 @@ O computador precisa permanecer ligado. Fechar a aba mantém o servidor ativo; *
 - Séries agrupadas em temporadas; nomes `S01E02` e `1x02` reconhecidos automaticamente.
 - Controle remoto da TV para pausar e continuar, além dos controles da interface.
 - Com um vídeo ativo na TV, use **Ir para o tempo** (`12:30` ou `01:12:30`) ou os botões de voltar/avançar 10 segundos. O programa confirma o tempo com a TV antes de salvar o novo ponto; o ajuste também funciona com o vídeo pausado, se o reprodutor aceitar DLNA Seek.
+- Com FFmpeg instalado, o Sala TV verifica o áudio antes do envio. Se o áudio estiver fora do perfil AAC LC mono/estéreo a 44,1 ou 48 kHz, ele converte as faixas para AAC LC estéreo a 48 kHz e copia a imagem sem recompressão. A primeira reprodução pode demorar; as próximas reutilizam a cópia em `dados/audio-cache/`. O original e as legendas são preservados. A adaptação não muda o codec do vídeo. Se o FFmpeg não for encontrado, o programa avisa e não envia o vídeo, em vez de arriscar um áudio incompatível.
+- Marcar um título como assistido apaga as cópias convertidas dele em `dados/audio-cache/`, liberando espaço. Se a cópia estiver tocando ou sendo preparada, a limpeza é adiada e repetida automaticamente quando a TV liberar o arquivo. Reassistir um título recria a cópia se o áudio ainda precisar de adaptação.
 - Progresso consultado a cada 2 segundos; retomada cerca de 3 segundos antes do ponto salvo.
 - Associação automática de SRT quando o nome corresponde ou há uma única legenda na pasta; seleção manual em **Detalhes**.
 - Capas do TMDB com busca por título/ano e escolha manual para ambiguidades.

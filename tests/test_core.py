@@ -97,6 +97,43 @@ class CoreTests(unittest.TestCase):
             app.play('a'*20,False)
         self.assertTrue(converted.exists())
         self.assertNotIn('a'*20,app.AUDIO_CLEANUP)
+    def test_play_retries_until_tv_starts(self):
+        video=app.DATA/'test.mp4'
+        video.write_bytes(b'test')
+        ident='a'*20
+        self.media(ident,video)
+        replies=[{},{},{'CurrentTransportState':'STOPPED'},{},{'CurrentTransportState':'PLAYING'}]
+        with patch.object(app,'observe'), patch.object(app,'pc_ip',return_value='127.0.0.1'), patch.object(app,'prepare_tv_media',return_value=(video,'movie.mp4')), patch.object(app,'soap',side_effect=replies) as soap, patch.object(app.time,'sleep'):
+            app.play(ident,False)
+        self.assertEqual([call.args[0] for call in soap.call_args_list].count('Play'),2)
+        self.assertEqual(app.STATE['active'],ident)
+        self.assertFalse(app.STATE['pending'])
+    def test_play_reports_when_tv_never_starts(self):
+        video=app.DATA/'test.mp4'
+        video.write_bytes(b'test')
+        ident='a'*20
+        self.media(ident,video)
+        def reply(action,args):
+            return {'CurrentTransportState':'STOPPED'} if action=='GetTransportInfo' else {}
+        with patch.object(app,'observe'), patch.object(app,'pc_ip',return_value='127.0.0.1'), patch.object(app,'prepare_tv_media',return_value=(video,'movie.mp4')), patch.object(app,'soap',side_effect=reply), patch.object(app.time,'sleep'):
+            with self.assertRaisesRegex(RuntimeError,'não iniciou'):
+                app.play(ident,False)
+        self.assertFalse(app.STATE['pending'])
+        self.assertIsNone(app.STATE['active'])
+    def test_conversion_progress_is_exposed_and_cleared(self):
+        video=app.DATA/'test.mp4'
+        video.write_bytes(b'test')
+        ident='a'*20
+        self.media(ident,video)
+        def fake(encoder,cache,media_id,source,on_convert,active,on_progress,duration):
+            on_convert()
+            on_progress(0.5)
+            self.assertAlmostEqual(app.STATE['progress'],0.5)
+            return video,'movie.mp4'
+        with patch.object(app,'audio_compat') as compat, patch.object(app,'ffmpeg',return_value='ffmpeg'):
+            compat.prepare.side_effect=fake
+            self.assertEqual(app.prepare_tv_media(app.get_media(ident)),(video,'movie.mp4'))
+        self.assertIsNone(app.STATE['progress'])
     def test_invalid_watch_action_does_not_change_item(self):
         self.media('a'*20,app.DATA/'test.mp4')
         with self.assertRaises(ValueError): app.set_watch_status('a'*20,'delete')
@@ -106,7 +143,7 @@ class CoreTests(unittest.TestCase):
         video.write_bytes(b'test')
         self.media('a'*20,video)
         app.set_watch_status('a'*20,'watched')
-        with patch.object(app,'observe'), patch.object(app,'soap',return_value={}) as soap, patch.object(app,'pc_ip',return_value='127.0.0.1'), patch.object(app,'prepare_tv_media',return_value=(video,'movie.mp4')):
+        with patch.object(app,'observe'), patch.object(app,'soap',return_value={}) as soap, patch.object(app,'pc_ip',return_value='127.0.0.1'), patch.object(app.time,'sleep'), patch.object(app,'prepare_tv_media',return_value=(video,'movie.mp4')):
             app.play('a'*20,True)
         item=app.get_media('a'*20)
         self.assertEqual((item['watched'],item['continue_hidden'],item['position']),(0,0,0))

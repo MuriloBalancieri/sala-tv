@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import webbrowser
@@ -32,12 +33,13 @@ DATA.mkdir(parents=True,exist_ok=True)
 DB = DATA / 'biblioteca.sqlite'
 PORT = 8768
 TOKEN = secrets.token_hex(24)
+INSTANCE = hashlib.sha256(TOKEN.encode()).hexdigest()[:12]
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.m4v', '.ts', '.webm'}
 LOCK = threading.RLock()
 CONTROL = threading.RLock()
 ENDING = threading.Event()
-STATE = {'active': None, 'pending': False, 'state': 'IDLE', 'message': 'Escolha um título para assistir.', 'connected': False}
+STATE = {'active': None, 'pending': False, 'state': 'IDLE', 'message': 'Escolha um título para assistir.', 'connected': False, 'progress': None}
 COVER_JOB={'running':False,'done':0,'total':0,'message':''}
 ASSET_LOCK=threading.RLock()
 MISSING_FILES={}
@@ -218,12 +220,36 @@ def pc_ip():
         return route.getsockname()[0]
 
 def prepare_tv_media(item):
-    def adapting():
+    stop = threading.Event()
+    started = time.monotonic()
+    duration = float(item['duration'] or 0)
+    def progress(fraction):
+        elapsed = int(time.monotonic() - started)
         with LOCK:
+            STATE['progress'] = fraction if duration > 0 else None
+            percent = f' {int(fraction * 100)}%' if duration > 0 else ''
+            STATE['message'] = f'Adaptando o áudio para AAC estéreo a 48 kHz…{percent} {elapsed//60}:{elapsed%60:02}'
+    def adapting():
+        def tick():
+            while not stop.wait(5):
+                with LOCK:
+                    if STATE.get('progress') is not None:
+                        continue
+                    elapsed = int(time.monotonic() - started)
+                    STATE['message'] = f'Adaptando o áudio para AAC estéreo a 48 kHz… {elapsed//60}:{elapsed%60:02}'
+        with LOCK:
+            STATE['progress'] = 0.0 if duration > 0 else None
             STATE['message'] = 'Adaptando o áudio para AAC estéreo a 48 kHz. Aguarde o preparo antes da reprodução…'
+        threading.Thread(target=tick, daemon=True).start()
     with LOCK:
         active = STATE['active']
-    return audio_compat.prepare(ffmpeg(), DATA/'audio-cache', item['id'], item['path'], adapting, active)
+    try:
+        return audio_compat.prepare(ffmpeg(), DATA/'audio-cache', item['id'], item['path'],
+                                    adapting, active, progress, duration)
+    finally:
+        stop.set()
+        with LOCK:
+            STATE['progress'] = None
 
 
 def media_mime(path):
@@ -540,7 +566,7 @@ def add_file(path):
 def play(ident, resume=True):
     with CONTROL:
         with LOCK:
-            STATE.update(pending=True,message='Verificando o áudio do vídeo…')
+            STATE.update(pending=True,message='Verificando o áudio do vídeo…',progress=None)
         try:
             observe(force=True)
             item = get_media(ident)
@@ -565,10 +591,24 @@ def play(ident, resume=True):
                 f'protocolInfo="http-get:*:{media_mime(media_path)}:DLNA.ORG_OP=01;DLNA.ORG_CI=0">{url}</res>'
                 +(f'<sec:CaptionInfoEx sec:type="srt">{caption}</sec:CaptionInfoEx>' if subtitle else '')+'</item></DIDL-Lite>')
             soap('SetAVTransportURI',{'InstanceID':0,'CurrentURI':url,'CurrentURIMetaData':metadata})
-            try:
-                soap('Play',{'InstanceID':0,'Speed':1})
-            except RuntimeError:
-                pass  # O firmware pode iniciar sozinho ao receber a URI.
+            started = False
+            last_error = None
+            for _ in range(6):
+                try:
+                    soap('Play',{'InstanceID':0,'Speed':1})
+                except RuntimeError as exc:
+                    last_error = exc
+                time.sleep(1)
+                try:
+                    state = soap('GetTransportInfo',{'InstanceID':0}).get('CurrentTransportState')
+                except Exception:
+                    continue
+                if state is None or state != 'STOPPED':
+                    started = True
+                    break
+            if not started:
+                print('A TV não iniciou a reprodução:', last_error or 'ficou em STOPPED', flush=True)
+                raise RuntimeError('A TV recebeu o vídeo, mas não iniciou a reprodução. Tente enviar novamente.')
             with connect() as db:
                 db.execute('UPDATE media SET watched=0,continue_hidden=0 WHERE id=?', (ident,))
             with LOCK:
@@ -657,7 +697,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 items=[dict(row) for row in db.execute('SELECT * FROM media ORDER BY last_watched DESC,title')]
             with LOCK:
                 state=dict(STATE)
-            return self.send({'items':items,'tv_ip':setting('tv_ip'),'state':state,
+            return self.send({'items':items,'tv_ip':setting('tv_ip'),'state':state,'instance':INSTANCE,
                 'tmdb_configured':bool(setting('tmdb_access')),'cover_job':dict(COVER_JOB)})
         if self.path=='/api/health':
             return self.send({'app':'Sala TV'})
@@ -790,7 +830,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 get_media(ident)
                 with LOCK:
                     if STATE['pending']: raise ValueError('Aguarde o envio atual.')
-                    STATE.update(pending=True,message='Verificando o áudio do vídeo…')
+                    STATE.update(pending=True,message='Verificando o áudio do vídeo…',progress=None)
                     STATE.pop('preserve_bookmark',None)
                 def task():
                     try: play(ident,data.get('resume',True))
@@ -876,9 +916,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self.send({'error':str(exc)},400)
 
+def log_event(text, exc=None):
+    try:
+        with (DATA/'app.log').open('a', encoding='utf-8') as log:
+            log.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {text}\n')
+            if exc:
+                traceback.print_exception(exc[0], exc[1], exc[2], file=log)
+    except OSError:
+        pass
+
+
+def install_logging():
+    def hook(type_, value, tb):
+        log_event('Erro não tratado:', (type_, value, tb))
+    sys.excepthook = hook
+    def thread_hook(args):
+        name = args.thread.name if args.thread else 'desconhecida'
+        log_event(f'Erro na thread {name}:', (args.exc_type, args.exc_value, args.exc_traceback))
+    threading.excepthook = thread_hook
+
+
+def app_running():
+    try:
+        with OPENER.open(f'http://127.0.0.1:{PORT}/api/health', timeout=2) as response:
+            return json.load(response).get('app') == 'Sala TV'
+    except Exception:
+        return False
+
+
 def run():
     initialize()
-    server=http.server.ThreadingHTTPServer(('0.0.0.0',PORT),Handler)
+    try:
+        server=http.server.ThreadingHTTPServer(('0.0.0.0',PORT),Handler)
+    except OSError as exc:
+        if app_running():
+            log_event('Já havia uma instância em execução; abrindo a interface.')
+            webbrowser.open(f'http://127.0.0.1:{PORT}')
+            return
+        log_event('Não foi possível abrir a porta:', (type(exc), exc, exc.__traceback__))
+        raise RuntimeError(f'A porta {PORT} está em uso por outro programa. Feche-o e abra o Sala TV novamente.') from exc
+    log_event(f'Iniciado (pid {os.getpid()}).')
     server.daemon_threads=True
     threading.Thread(target=monitor,daemon=True).start()
     threading.Thread(target=maintenance,daemon=True).start()
@@ -893,26 +970,23 @@ def main():
     parser.add_argument('--pick',choices=('files','folder','subtitle'))
     parser.add_argument('--launch',action='store_true')
     args=parser.parse_args()
+    install_logging()
     if args.pick:
         return native_pick(args.pick)
     if args.launch:
         url=f'http://127.0.0.1:{PORT}'
-        running=False
-        try:
-            with OPENER.open(url+'/api/health',timeout=2) as response:
-                running=json.load(response).get('app')=='Sala TV'
-        except Exception: pass
-        if not running:
+        if not app_running():
             log=(DATA/'app.log').open('a',encoding='utf-8')
             child=subprocess.Popen([sys.executable,'-u',str(ROOT/'app.py')],stdout=log,stderr=log,creationflags=subprocess.CREATE_NO_WINDOW)
             log.close()
-            for _ in range(60):
-                if child.poll() is not None: raise RuntimeError('Não foi possível abrir. Consulte dados/app.log.')
-                try:
-                    with OPENER.open(url+'/api/health',timeout=1) as response:
-                        if json.load(response).get('app')=='Sala TV': break
-                except Exception: time.sleep(.25)
-            else: raise RuntimeError('O programa demorou a iniciar.')
+            for _ in range(80):
+                if app_running(): break
+                if child.poll() is not None: break
+                time.sleep(.25)
+        if not app_running():
+            try: detail=(DATA/'app.log').read_text(encoding='utf-8',errors='replace')[-1200:]
+            except OSError: detail=''
+            raise RuntimeError('Não foi possível abrir o Sala TV. Consulte dados/app.log.'+(f'\n{detail}' if detail else ''))
         webbrowser.open(url)
     else: run()
 

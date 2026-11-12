@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import threading
 
 
 CACHE_LIMIT = 12 * 1024**3
@@ -85,7 +86,8 @@ def discard(cache, ident):
     return remaining
 
 
-def prepare(encoder, cache, ident, source, on_convert=lambda: None, active=None):
+def prepare(encoder, cache, ident, source, on_convert=lambda: None, active=None,
+            on_progress=lambda fraction: None, duration=0):
     source = Path(source)
     original = (source, 'movie' + source.suffix.lower())
     if not encoder:
@@ -106,18 +108,43 @@ def prepare(encoder, cache, ident, source, on_convert=lambda: None, active=None)
     fd, tmp = tempfile.mkstemp(prefix='.audio-', suffix=target.suffix, dir=cache)
     os.close(fd)
     temporary = Path(tmp)
+    progress_file = temporary.with_suffix(temporary.suffix + '.progress')
+    stop_progress = threading.Event()
+    def watch_progress():
+        while not stop_progress.wait(1):
+            try:
+                text = progress_file.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            fraction = 1.0 if re.search(r'^progress=end$', text, re.MULTILINE) else 0.0
+            if not fraction:
+                times = re.findall(r'^out_time_us=(\d+)$', text, re.MULTILINE)
+                fraction = min(1.0, int(times[-1]) / 1_000_000 / duration) if times and duration > 0 else 0.0
+            try:
+                on_progress(fraction)
+            except Exception:
+                return
+    watcher = threading.Thread(target=watch_progress, daemon=True)
     try:
-        args = ['-v', 'error', '-xerror', '-y', '-i', str(source), '-map', '0:v:0', '-map', '0:a',
+        args = ['-v', 'error', '-xerror', '-y', '-progress', str(progress_file),
+                '-i', str(source), '-map', '0:v:0', '-map', '0:a',
                 '-map', '0:s?', '-c:v', 'copy', '-c:s', 'copy', '-c:a', 'aac', '-profile:a', 'aac_low',
                 '-ac', '2', '-ar', '48000', '-b:a', '192k']
         if target.suffix == '.mp4':
             args += ['-movflags', '+faststart']
+        on_progress(0.0)
+        watcher.start()
         run_ffmpeg(encoder, [*args, str(temporary)], 1800)
         if not temporary.stat().st_size or cache_entry(cache, ident, source)[0] != target:
             raise RuntimeError('O vídeo mudou durante o preparo. Tente enviá-lo novamente.')
+        on_progress(1.0)
         temporary.replace(target)
     finally:
+        stop_progress.set()
+        if watcher.is_alive():
+            watcher.join(timeout=2)
         temporary.unlink(missing_ok=True)
+        progress_file.unlink(missing_ok=True)
     try:
         prune_cache(cache, target, active)
     except OSError:

@@ -33,7 +33,12 @@ class AudioCompatibilityTests(unittest.TestCase):
     def test_incompatible_audio_is_converted_without_changing_video_or_source(self):
         encoder = self.fixture(96000)
         original = self.source.read_bytes()
-        converted, name = audio_compat.prepare(encoder, self.cache, self.ident, self.source)
+        seen = []
+        converted, name = audio_compat.prepare(encoder, self.cache, self.ident, self.source,
+                                               on_progress=seen.append, duration=1)
+        self.assertEqual(seen[0], 0.0)
+        self.assertEqual(seen[-1], 1.0)
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in seen))
         self.assertNotEqual(converted, self.source)
         self.assertEqual(self.source.read_bytes(), original)
         probe = audio_compat.run_ffmpeg(encoder, ['-i', str(converted), '-t', '0', '-f', 'null', '-'], 15)
